@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIフルオート栄養管理（API連携版）</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f0f2f5; padding: 20px; color: #333; }
+        .container { max-width: 500px; margin: 0 auto; background: white; padding: 25px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; font-size: 1.5rem; margin-bottom: 20px; color: #1a73e8; }
+
+        /* APIキー設定エリア */
+        .api-settings { background: #fff3cd; padding: 10px; border-radius: 8px; margin-bottom: 20px; font-size: 0.9rem; border: 1px solid #ffeeba;}
+        .api-settings input { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; }
+
+        /* PFCダッシュボード */
+        .dashboard { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-bottom: 25px; }
+        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 12px; text-align: center; border-bottom: 4px solid #ddd; }
+        .stat-card.kcal { grid-column: span 2; background: #e8f0fe; border-color: #1a73e8; }
+        .stat-card.p { border-color: #ea4335; }
+        .stat-card.f { border-color: #fbbc04; }
+        .stat-card.c { border-color: #34a853; }
+        .stat-label { font-size: 0.8rem; color: #666; display: block; }
+        .stat-value { font-size: 1.4rem; font-weight: bold; }
+
+        /* 入力エリア */
+        .input-area { display: flex; gap: 8px; margin-bottom: 20px; }
+        input[type="text"] { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 1rem; }
+        button { padding: 12px 20px; background: #1a73e8; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; }
+        button:hover { background: #1557b0; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+
+        .history-item { display: flex; justify-content: space-between; font-size: 0.9rem; padding: 10px 0; border-bottom: 1px solid #eee; }
+        #loading { display: none; text-align: center; color: #1a73e8; font-size: 0.9rem; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>どんな食材でもAI解析</h1>
+
+    <div class="api-settings">
+        <label>⚙️ Gemini APIキー（初回のみ入力）</label>
+        <input type="password" id="api-key" placeholder="AI Studioで取得したAPIキーを入力">
+    </div>
+
+    <div class="dashboard">
+        <div class="stat-card kcal"><span class="stat-label">合計カロリー</span><span class="stat-value" id="v-kcal">0</span> kcal</div>
+        <div class="stat-card p"><span class="stat-label">タンパク質(P)</span><span class="stat-value" id="v-p">0</span> g</div>
+        <div class="stat-card f"><span class="stat-label">脂質(F)</span><span class="stat-value" id="v-f">0</span> g</div>
+        <div class="stat-card c"><span class="stat-label">炭水化物(C)</span><span class="stat-value" id="v-c">0</span> g</div>
+    </div>
+
+    <div class="input-area">
+        <input type="text" id="food-input" placeholder="例: 牛丼並盛、バナナ2本、鶏むね200g">
+        <button id="add-btn" onclick="analyzeFood()">解析＆追加</button>
+    </div>
+    
+    <div id="loading">AIが栄養素を計算中... ⏳</div>
+
+    <div id="history-list"></div>
+</div>
+
+<script>
+    let totalNutrition = { kcal: 0, p: 0, f: 0, c: 0 };
+
+    window.onload = () => {
+        const savedKey = localStorage.getItem('gemini_api_key');
+        if (savedKey) document.getElementById('api-key').value = savedKey;
+    };
+
+    // ★追加：プロ仕様の「自動リトライ機能」
+    // エラーが出ても、指定した回数だけ自動で再チャレンジします
+    async function fetchWithRetry(url, options, maxRetries = 3) {
+        const loadingText = document.getElementById('loading');
+        
+        for (let i = 0; i < maxRetries; i++) {
+            const response = await fetch(url, options);
+            
+            // 503(混雑) または 429(制限) の場合は少し待ってからやり直す
+            if (response.status === 503 || response.status === 429) {
+                // 待機時間を徐々に長くする（1回目:約2秒、2回目:約4秒、3回目:約8秒）
+                const waitTime = (Math.pow(2, i) * 1000) + (Math.random() * 1000); 
+                console.warn(`サーバー混雑(${response.status})。${Math.round(waitTime/1000)}秒後に再試行します (${i+1}/${maxRetries}回目)`);
+                
+                // 画面のテキストを更新してユーザーに知らせる
+                loadingText.innerText = `サーバー混雑中... 自動で再接続しています (${i+1}/${maxRetries}) ⏳`;
+                
+                // 指定した時間だけ待機
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                continue; // ループの最初に戻って再通信
+            }
+            
+            // 成功、もしくは503/429以外の致命的なエラーなら結果を返す
+            return response;
+        }
+        throw new Error("サーバーが大変混雑しています。しばらく時間を置いてから再度お試しください。");
+    }
+
+    async function analyzeFood() {
+        const apiKey = document.getElementById('api-key').value.trim();
+        const inputText = document.getElementById('food-input').value.trim();
+        const btn = document.getElementById('add-btn');
+        const loading = document.getElementById('loading');
+
+        if (!apiKey) return alert("APIキーを入力してください。");
+        if (!inputText) return alert("食材を入力してください。");
+
+        localStorage.setItem('gemini_api_key', apiKey);
+
+        btn.disabled = true;
+        loading.style.display = 'block';
+        loading.innerText = "AIが栄養素を計算中... ⏳"; // 初期テキスト
+
+        const prompt = `
+        ユーザーが入力した食事内容から、正確な栄養素を推測して計算してください。
+        入力内容：「${inputText}」
+        
+        以下のキーを持つJSONオブジェクトを出力してください:
+        "name": 整理されたメニュー名と量 (例: バナナ 2本)
+        "kcal": カロリーの数値(整数)
+        "p": タンパク質の数値(小数点1桁)
+        "f": 脂質の数値(小数点1桁)
+        "c": 炭水化物の数値(小数点1桁)
+        `;
+
+        const modelName = "gemini-2.5-flash";
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+        try {
+            // ★変更：通常のfetchではなく、上で作ったfetchWithRetryを使う
+            const response = await fetchWithRetry(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: {
+                        responseMimeType: "application/json"
+                    }
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`エラー番号 ${response.status}: ${errorData.error?.message || "原因不明"}`);
+            }
+
+            const data = await response.json();
+            const aiText = data.candidates[0].content.parts[0].text;
+            const result = JSON.parse(aiText);
+
+            addResultToUI(result);
+            document.getElementById('food-input').value = "";
+
+        } catch (error) {
+            console.error("システムエラー詳細:", error);
+            alert(`【通信エラー】\n${error.message}`);
+        } finally {
+            btn.disabled = false;
+            loading.style.display = 'none';
+            loading.innerText = "AIが栄養素を計算中... ⏳"; // リセット
+        }
+    }
+
+    function addResultToUI(data) {
+        totalNutrition.kcal += data.kcal;
+        totalNutrition.p += data.p;
+        totalNutrition.f += data.f;
+        totalNutrition.c += data.c;
+
+        document.getElementById('v-kcal').textContent = totalNutrition.kcal;
+        document.getElementById('v-p').textContent = totalNutrition.p.toFixed(1);
+        document.getElementById('v-f').textContent = totalNutrition.f.toFixed(1);
+        document.getElementById('v-c').textContent = totalNutrition.c.toFixed(1);
+
+        const item = document.createElement('div');
+        item.className = 'history-item';
+        item.innerHTML = `<strong>${data.name}</strong> <span>${data.kcal}kcal / P:${data.p}g / F:${data.f}g / C:${data.c}g</span>`;
+        document.getElementById('history-list').prepend(item);
+    }
+</script>
+
+</body>
+</html>
